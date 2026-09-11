@@ -1,577 +1,280 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-
+import { Context } from '@deepseek-ai/cordis'
+import { LlmAdapter, LlmRuntime, markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
+import { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import { apply, deterministicBlockReason, resolveConfig } from '../index.js'
 
-const LOCAL_ROUTE = { provider: 'local-ai-test', model: 'local-model' }
-const CLOUD_ROUTE = { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
-
-function userMessage(text, id = crypto.randomUUID()) {
-  return {
-    id,
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'user' },
-  }
+const LOCAL = { provider: 'local-ai-test', model: 'local-model' }
+const CLOUD = { provider: 'cloud-test', model: 'cloud-model' }
+const VIRTUAL = { provider: 'privacy-router', model: 'auto' }
+const user = (text, extra = {}) => ({ id: crypto.randomUUID(), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }], ...extra })
+const collect = async stream => { const result = []; for await (const chunk of stream) result.push(chunk); return result }
+function classification(value = 'public') {
+  return [{ type: 'block-end', index: 0, block: { type: 'tool-call', id: 'classification', name: 'structured_output', arguments: JSON.stringify({ classification: value, reason: 'Test assessment.' }) } }, { type: 'finish', reason: { kind: 'tool-calls' } }]
 }
-
-function assistantMessage(text, provider, model, id = crypto.randomUUID()) {
-  return {
-    id,
-    role: 'assistant',
-    content: [{ type: 'text', text }],
-    source: { kind: 'model', provider, model },
-  }
+class MemorySettings extends SettingsProvider {
+  writable = true
+  writes = []
+  async load() { return {} }
+  async persist(ns, value) { this.writes.push({ ns, value: structuredClone(value) }) }
 }
-
-function classifierChunks(classification, reason = 'The request is safe for the cloud.') {
-  return [
-    { type: 'block-start', index: 0, blockType: 'tool-call' },
-    {
-      type: 'tool-call-delta',
-      index: 0,
-      id: 'classification',
-      name: 'structured_output',
-      argumentsDelta: JSON.stringify({ classification, reason }),
-    },
-    {
-      type: 'block-end',
-      index: 0,
-      block: {
-        type: 'tool-call',
-        id: 'classification',
-        name: 'structured_output',
-        arguments: JSON.stringify({ classification, reason }),
-      },
-    },
-    { type: 'finish', reason: { kind: 'tool-calls' } },
-  ]
-}
-
-const CLOUD_CHUNKS = [
-  { type: 'block-start', index: 0, blockType: 'text' },
-  { type: 'text-delta', index: 0, text: 'cloud answer' },
-  { type: 'block-end', index: 0, block: { type: 'text', text: 'cloud answer' } },
-  { type: 'finish', reason: { kind: 'stop' } },
-]
-
-function context(classification = 'public', options = {}) {
-  const listeners = new Map()
+async function fixture(t, options = {}) {
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(MemorySettings)
+  t.after(() => ctx.fiber.dispose())
   const requests = []
-  let originalCalls = 0
-
-  const ctx = {
-    on(event, listener) {
-      listeners.set(event, listener)
-    },
-    llm: {
-      stream(request) {
-        requests.push(request)
-        const downstream = async function* () {
-          const chunks = request.provider === CLOUD_ROUTE.provider
-            ? options.cloudChunks ?? CLOUD_CHUNKS
-            : options.classifierChunks ?? classifierChunks(classification)
-          yield* chunks
-        }
-        return listeners.get('llm/stream')(request, downstream)
-      },
-    },
+  class Boundary extends LlmAdapter {
+    async resolveModel(provider, model) {
+      return { provider, id: model, name: model, context: { contextWindow: 32768 }, defaultMaxTokens: 2048, reasoning: { efforts: [{ id: 'off', name: 'Off' }, { id: 'high', name: 'High' }] } }
+    }
+    async *stream(request) {
+      requests.push(structuredClone({ ...request, signal: undefined }))
+      if (request.tools?.[0]?.name === 'structured_output') {
+        if (options.onClassify) await options.onClassify(request)
+        if (options.classifierError) throw new Error('classifier unavailable')
+        yield* options.classifierChunks ?? classification(options.classification)
+      } else {
+        if (options.onGenerate) await options.onGenerate(request)
+        yield* options.cloudChunks && request.provider === CLOUD.provider ? options.cloudChunks : [{ type: 'text-delta', index: 0, text: `${request.provider} answer` }, { type: 'finish', reason: { kind: 'stop' } }]
+      }
+    }
   }
-
-  apply(ctx, {
-    cloudProvider: CLOUD_ROUTE.provider,
-    cloudModel: CLOUD_ROUTE.model,
-    recordSessionEvents: options.recordSessionEvents ?? true,
-  })
-
+  ctx.llm.registerAdapter([LOCAL.provider, CLOUD.provider, 'local-ai-second'], new Boundary())
+  apply(ctx, options.unconfigured ? {} : { localProvider: LOCAL.provider, localModel: LOCAL.model, cloudProvider: CLOUD.provider, cloudModel: CLOUD.model, ...options.config })
+  const makeAgent = (history = []) => ({ session: { id: crypto.randomUUID(), deriveMessages: () => history, requestHeader: () => ({ config: VIRTUAL }) }, options: VIRTUAL })
+  const currentAgent = makeAgent()
+  const controller = new AbortController()
+  const payload = (extra = {}) => ({ agent: currentAgent, turn: 1, step: 1, signal: controller.signal, ...extra })
   return {
-    preStep: listeners.get('agent/pre-step'),
-    request: listeners.get('agent/request'),
-    stream: listeners.get('llm/stream'),
-    requests,
-    original: async function* () {
-      originalCalls += 1
-      yield { type: 'text-delta', index: 0, text: 'local answer' }
-      yield { type: 'finish', reason: { kind: 'stop' } }
+    ctx, requests, currentAgent, controller, makeAgent, payload,
+    classifierRequests: () => requests.filter(r => r.tools?.[0]?.name === 'structured_output'),
+    generationRequests: () => requests.filter(r => r.tools?.[0]?.name !== 'structured_output'),
+    async pre(messages, extra) { return ctx.waterfall('agent/pre-step', payload({ messages, ...extra }), async () => ({ kind: 'enter', messages })) },
+    async request(route = VIRTUAL, extra) { return ctx.waterfall('agent/request', payload(extra), async () => route) },
+    async stream(route = VIRTUAL, extra = {}) {
+      const { agent: dispatchAgent, ...requestExtra } = extra
+      const signal = extra.signal ?? controller.signal
+      const prepared = await ctx.llm.prepareCall(route, signal)
+      const request = markAgentLoopRequest({ ...prepared.config, messages: [user('private full context')], system: 'private runtime context', tools: [{ name: 'read_file', parameters: {} }], sessionId: extra.agent?.session.id ?? currentAgent.session.id, signal, ...requestExtra })
+      return collect(prepared.stream(request))
     },
-    originalCalls: () => originalCalls,
   }
 }
 
-function agent(history = [], seedEvents = []) {
-  const events = []
-  const sessionEvents = [...seedEvents]
-  return {
-    id: 'agent-1',
-    options: LOCAL_ROUTE,
-    session: {
-      id: 'session-1',
-      append(type, data) {
-        events.push({ type, data })
-        sessionEvents.push({ type, data })
-      },
-      deriveMessages: () => [...history],
-      snapshotEvents: () => [...sessionEvents],
-      get events() {
-        return sessionEvents
-      },
-      requestHeader: () => ({ config: LOCAL_ROUTE }),
-    },
-    events,
+test('ordinary local and direct cloud retain request controls, messages and tools without classification', async t => {
+  const f = await fixture(t)
+  for (const route of [LOCAL, CLOUD]) {
+    const selected = { ...route, maxTokens: 500, reasoningEffort: 'high', temperature: 0.5 }
+    await f.pre([user('api_key=do-not-route-this-secret')])
+    assert.deepEqual(await f.request(selected), selected)
+    await f.stream(selected)
+    const sent = f.generationRequests().at(-1)
+    assert.equal(sent.provider, route.provider)
+    assert.equal(sent.reasoningEffort, 'high')
+    assert.equal(sent.maxTokens, 500)
+    assert.equal(sent.tools[0].name, 'read_file')
+    assert.equal(sent.messages[0].content[0].text, 'private full context')
   }
-}
-
-async function routeTurn(fixture, currentAgent, messages, fullHistory = messages) {
-  await fixture.preStep({
-    agent: currentAgent,
-    messages,
-    turn: 1,
-    step: 1,
-    signal: new AbortController().signal,
-  }, async () => undefined)
-
-  const route = await fixture.request({
-    agent: currentAgent,
-    turn: 1,
-    step: 1,
-    signal: new AbortController().signal,
-  }, async () => LOCAL_ROUTE)
-
-  const chunks = []
-  for await (const chunk of fixture.stream({
-    ...route,
-    messages: fullHistory,
-    system: 'private cwd: /Users/example/private-project',
-    tools: [{ name: 'read_file', description: 'Read local files', parameters: {} }],
-    sessionId: currentAgent.session.id,
-  }, fixture.original)) chunks.push(chunk)
-
-  return { route, chunks }
-}
-
-test('configuration fails loud and deterministic rules block credentials', () => {
-  assert.throws(() => resolveConfig({ unknown: true }), /unknown privacy router config key/)
-  assert.throws(
-    () => resolveConfig({ trustedProviders: [], trustedProviderPrefixes: [] }),
-    /cannot both be empty/,
-  )
-
-  const config = resolveConfig()
-  assert.equal(config.classifierMaxTokens, 128)
-  assert.equal(config.recordSessionEvents, false)
-  assert.throws(() => resolveConfig({ recordSessionEvents: 'yes' }), /must be a boolean/)
-  assert.equal(
-    deterministicBlockReason('Use api_key=not-a-real-secret-value for the request.', config),
-    'assigned-secret',
-  )
-  assert.equal(deterministicBlockReason('/Users/example/private/file.ts', config), 'local-path')
-  assert.equal(deterministicBlockReason('/home/example/private/file.ts', config), 'local-path')
-  assert.equal(deterministicBlockReason('./src/file.ts', config), undefined)
+  assert.equal(f.classifierRequests().length, 0)
 })
 
-test('stock DSH mode routes without custom session events', async () => {
-  const fixture = context('public', { recordSessionEvents: false })
-  const previousUser = userMessage('Previously approved public question.', 'previous-user')
-  const previousAssistant = assistantMessage(
-    'Previously approved cloud answer.',
-    CLOUD_ROUTE.provider,
-    CLOUD_ROUTE.model,
-    'previous-assistant',
-  )
-  const current = userMessage('Compare HTTP/2 and HTTP/3.', 'current')
-  const history = [previousUser, previousAssistant]
-  const currentAgent = agent(history, [{
-    type: 'privacy-router/check-result',
-    data: { decision: 'cloud', turn: 0, approvedMessageIds: [previousUser.id] },
-  }])
-
-  const result = await routeTurn(fixture, currentAgent, [current], [...history, current])
-
-  assert.deepEqual(result.route, { ...CLOUD_ROUTE, maxTokens: 8_192 })
-  assert.deepEqual(currentAgent.events, [])
-  assert.deepEqual(fixture.requests[1].messages, [current])
+test('router preserves virtual selection and sends only clean current text to cloud', async t => {
+  const f = await fixture(t)
+  const privateAgent = f.makeAgent([user('private history /home/test/secret')])
+  const current = user('Explain HTTP/3.', { privateMetadata: 'must not leave', source: { kind: 'user', privateMetadata: 'also private' } })
+  await f.pre([current], { agent: privateAgent })
+  const route = await f.request(VIRTUAL, { agent: privateAgent })
+  assert.deepEqual(route, VIRTUAL)
+  const result = await f.stream(route, { agent: privateAgent })
+  assert.equal(result[0].text, 'cloud-test answer')
+  assert.match(f.classifierRequests()[0].messages[0].content[0].text, /private history/)
+  const sent = f.generationRequests()[0]
+  assert.deepEqual(sent.messages, [{ id: current.id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Explain HTTP/3.' }] }])
+  assert.deepEqual(sent.tools, [])
+  assert.doesNotMatch(JSON.stringify(sent), /privateMetadata|private history|private runtime|private full/)
 })
 
-test('public input switches the visible request route and streams cloud output directly', async () => {
-  const fixture = context('public')
-  const current = userMessage('Compare HTTP/2 and HTTP/3 using public information.', 'current')
-  const privateHistory = userMessage('Private path: /Users/example/private-project', 'private-history')
-  const currentAgent = agent([privateHistory])
-
-  const result = await routeTurn(fixture, currentAgent, [current], [privateHistory, current])
-
-  assert.deepEqual(result.route, { ...CLOUD_ROUTE, maxTokens: 8_192 })
-  assert.equal(result.chunks.find(chunk => chunk.type === 'text-delta')?.text, 'cloud answer')
-  assert.equal(fixture.originalCalls(), 0)
-
-  const classifierRequest = fixture.requests[0]
-  assert.equal(classifierRequest.provider, LOCAL_ROUTE.provider)
-  assert.equal(classifierRequest.tools[0].name, 'structured_output')
-  assert.equal(classifierRequest.maxTokens, 128)
-  assert.equal(classifierRequest.reasoningEffort, 'off')
-  assert.match(classifierRequest.messages[0].content[0].text, /Private path/)
-
-  const cloudRequest = fixture.requests[1]
-  assert.deepEqual(cloudRequest.messages, [current])
-  assert.deepEqual(cloudRequest.tools, [])
-  assert.doesNotMatch(cloudRequest.system, /Users\/example|private-project/)
-  assert.equal(currentAgent.events.length, 3)
-  assert.deepEqual(currentAgent.events[0], {
-    type: 'privacy-router/check-start',
-    data: {
-      checkId: currentAgent.events[0].data.checkId,
-      turn: 1,
-      step: 1,
-    },
-  })
-  assert.deepEqual(currentAgent.events[2], {
-    type: 'privacy-router/cloud-dispatch',
-    data: {
-      checkId: currentAgent.events[0].data.checkId,
-      turn: 1,
-      step: 1,
-      sentMessages: [{ messageId: current.id, role: 'user' }],
-      withheldMessages: [{ messageId: privateHistory.id, role: 'user' }],
-      contextTruncated: false,
-      toolsIncluded: false,
-    },
-  })
-  assert.deepEqual(currentAgent.events[1], {
-    type: 'privacy-router/check-result',
-    data: {
-      checkId: currentAgent.events[0].data.checkId,
-      turn: 1,
-      step: 1,
-      classification: 'public',
-      method: 'model',
-      decision: 'cloud',
-      provider: CLOUD_ROUTE.provider,
-      model: CLOUD_ROUTE.model,
-      evaluatedMessageIds: [current.id],
-      approvedMessageIds: [current.id],
-      classifier: {
-        finish: 'tool-calls',
-        output: 'tool-call structured_output:\n{"classification":"public","reason":"The request is safe for the cloud."}',
-        reason: 'The request is safe for the cloud.',
-      },
-      durationMs: currentAgent.events[1].data.durationMs,
-    },
-  })
-  assert.equal(Number.isSafeInteger(currentAgent.events[1].data.durationMs), true)
-  assert.doesNotMatch(JSON.stringify(currentAgent.events), /HTTP\/2|private-project/)
+test('retry and tool continuation reuse immutable decision and settings, new turn uses saved settings', async t => {
+  const f = await fixture(t)
+  const current = user('Explain HTTP/3.')
+  await f.pre([current]); await f.request()
+  await f.ctx.settings.update('privacy-router', { cloudModel: 'changed-cloud', cloudMaxTokens: 99, privacyPolicy: 'new policy' })
+  current.content[0].text = 'mutated private content'
+  for (const step of [1, 2]) {
+    await f.pre([user('tool result', { source: { kind: 'tool' } })], { step })
+    assert.deepEqual(await f.request(VIRTUAL, { step }), VIRTUAL)
+    await f.stream()
+  }
+  assert.equal(f.classifierRequests().length, 1)
+  for (const sent of f.generationRequests()) {
+    assert.equal(sent.model, 'cloud-model'); assert.equal(sent.maxTokens, 8192)
+    assert.equal(sent.messages[0].content[0].text, 'Explain HTTP/3.')
+  }
+  await f.pre([user('Explain TCP.')], { turn: 2 }); await f.request(VIRTUAL, { turn: 2 }); await f.stream()
+  assert.equal(f.classifierRequests().length, 2)
+  assert.equal(f.generationRequests().at(-1).model, 'changed-cloud')
+  assert.equal(f.generationRequests().at(-1).maxTokens, 99)
 })
 
-test('resolves references locally while sending only previously approved cloud context', async () => {
-  const fixture = context('public')
-  const priorPublic = userMessage('HTTP/3 uses QUIC.', 'prior-public')
-  const priorCloud = assistantMessage(
-    'That usually improves loss isolation.',
-    CLOUD_ROUTE.provider,
-    CLOUD_ROUTE.model,
-    'prior-cloud-answer',
-  )
-  const priorPrivate = userMessage('Private path: /Users/example/private-project', 'prior-private')
-  const priorLocal = assistantMessage(
-    'The local project contains credentials.',
-    LOCAL_ROUTE.provider,
-    LOCAL_ROUTE.model,
-    'prior-local-answer',
-  )
-  const current = userMessage('Compare that with HTTP/2.', 'current-reference')
-  const currentAgent = agent(
-    [priorPublic, priorCloud, priorPrivate, priorLocal],
-    [
-      {
-        type: 'privacy-router/check-result',
-        data: { turn: 1, decision: 'cloud', approvedMessageIds: [priorPublic.id] },
-      },
-      {
-        type: 'assistant/message',
-        data: { turn: 1, step: 1, message: priorCloud },
-      },
-    ],
-  )
-
-  await routeTurn(fixture, currentAgent, [current])
-
-  const classifierPrompt = fixture.requests[0].messages[0].content[0].text
-  assert.match(classifierPrompt, /HTTP\/3 uses QUIC/)
-  assert.match(classifierPrompt, /private-project/)
-  assert.match(classifierPrompt, /"cloudSafe":true/)
-  assert.match(classifierPrompt, /"cloudSafe":false/)
-
-  const cloudRequest = fixture.requests[1]
-  assert.deepEqual(cloudRequest.messages, [priorPublic, priorCloud, current])
-  assert.doesNotMatch(JSON.stringify(cloudRequest), /private-project|credentials/)
-  assert.deepEqual(currentAgent.events[1].data.approvedMessageIds, [current.id])
-  assert.deepEqual(currentAgent.events[2].data, {
-    checkId: currentAgent.events[0].data.checkId,
-    turn: 1,
-    step: 1,
-    sentMessages: [
-      { messageId: priorPublic.id, role: 'user' },
-      { messageId: priorCloud.id, role: 'assistant' },
-      { messageId: current.id, role: 'user' },
-    ],
-    withheldMessages: [
-      { messageId: priorPrivate.id, role: 'user' },
-      { messageId: priorLocal.id, role: 'assistant' },
-    ],
-    contextTruncated: false,
-    toolsIncluded: false,
-  })
+test('switching away bypasses router and switching back requires a fresh admitted turn', async t => {
+  const f = await fixture(t)
+  await f.pre([user('Explain HTTP/3.')]); await f.request(); await f.stream()
+  assert.deepEqual(await f.request(LOCAL), LOCAL); await f.stream(LOCAL)
+  assert.deepEqual(await f.request(VIRTUAL), VIRTUAL); await f.stream()
+  assert.equal(f.classifierRequests().length, 1)
+  assert.equal(f.generationRequests().at(-1).provider, LOCAL.provider)
+  await f.pre([user('Explain TCP.')], { turn: 2 }); await f.request(VIRTUAL, { turn: 2 }); await f.stream()
+  assert.equal(f.generationRequests().at(-1).provider, CLOUD.provider)
 })
 
-test('records classifier output and terminal failure details', async t => {
+test('concurrent agents and prepared calls cannot share candidates or settings', async t => {
+  const f = await fixture(t)
+  const a = f.makeAgent(); const b = f.makeAgent()
+  const aSignal = new AbortController().signal; const bSignal = new AbortController().signal
+  await Promise.all([f.pre([user('Public A')], { agent: a, signal: aSignal }), f.pre([user('password=secret-for-b')], { agent: b, signal: bSignal })])
+  await Promise.all([f.request(VIRTUAL, { agent: a, signal: aSignal }), f.request(VIRTUAL, { agent: b, signal: bSignal })])
+  const preparedA = await f.ctx.llm.prepareCall(VIRTUAL, aSignal)
+  await f.ctx.settings.update('privacy-router', { cloudModel: 'changed' })
+  await f.stream(VIRTUAL, { agent: b, signal: bSignal })
+  await collect(preparedA.stream(markAgentLoopRequest({ ...preparedA.config, messages: [user('private full A')], sessionId: a.session.id, signal: aSignal })))
+  assert.equal(f.generationRequests()[0].provider, LOCAL.provider)
+  assert.equal(f.generationRequests()[1].model, 'cloud-model')
+  assert.equal(f.generationRequests()[1].messages[0].content[0].text, 'Public A')
+})
+
+test('credentials, sensitive, unknown, invalid classifier and multimodal all stay local', async t => {
   const cases = [
-    {
-      name: 'max tokens',
-      chunks: [
-        { type: 'block-start', index: 0, blockType: 'reasoning' },
-        { type: 'reasoning-delta', index: 0, text: 'still deciding' },
-        { type: 'finish', reason: { kind: 'max-tokens' } },
-      ],
-      reason: 'classifier-max-tokens',
-      classifier: { finish: 'max-tokens', output: 'reasoning:\nstill deciding' },
-    },
-    {
-      name: 'provider error',
-      chunks: [{
-        type: 'finish',
-        reason: {
-          kind: 'error',
-          failure: { code: 'TRANSPORT', message: 'classifier unavailable' },
-        },
-      }],
-      reason: 'classifier-error',
-      classifier: {
-        finish: 'error',
-        output: '',
-        error: 'TRANSPORT: classifier unavailable',
-      },
-    },
+    { text: 'api_key=not-a-real-secret' },
+    { classification: 'sensitive' }, { classification: 'unknown' }, { classifierError: true },
+    { classifierChunks: [{ type: 'finish', reason: { kind: 'error', failure: { code: 'OFFLINE', message: 'offline' } } }] },
+    { classifierChunks: [{ type: 'tool-call-delta', index: 0, name: 'structured_output', argumentsDelta: '{"classification":"public","reason":"truncated' }, { type: 'finish', reason: { kind: 'max-tokens' } }] },
+    { image: true },
   ]
+  for (const item of cases) await t.test(JSON.stringify(item), async t => {
+    const f = await fixture(t, item)
+    const candidate = user(item.text ?? 'Ambiguous request')
+    if (item.image) candidate.content.push({ type: 'image', url: 'data:image/png;base64,abc' })
+    await f.pre([candidate]); await f.request(); await f.stream()
+    assert.equal(f.generationRequests()[0].provider, LOCAL.provider)
+    assert.equal(f.generationRequests()[0].tools[0].name, 'read_file')
+  })
+})
 
-  for (const item of cases) {
-    await t.test(item.name, async () => {
-      const fixture = context('public', { classifierChunks: item.chunks })
-      const currentAgent = agent()
-      await routeTurn(fixture, currentAgent, [userMessage('Ambiguous standalone request')])
-      assert.equal(currentAgent.events[1].data.classification, 'unknown')
-      assert.equal(currentAgent.events[1].data.reason, item.reason)
-      assert.deepEqual(currentAgent.events[1].data.classifier, item.classifier)
-    })
+test('auxiliary and resumed virtual requests without admission fall back local', async t => {
+  const f = await fixture(t)
+  await f.pre([user('Public question')]); await f.request()
+  await collect(f.ctx.llm.stream({ ...VIRTUAL, sessionId: f.currentAgent.session.id, signal: f.controller.signal, purpose: 'session-title', messages: [user('private title data')] }))
+  await f.stream(VIRTUAL, { signal: new AbortController().signal })
+  assert.deepEqual(f.generationRequests().map(r => r.provider), [LOCAL.provider, LOCAL.provider])
+})
+
+test('abort during classification prevents any generation and a later signal gets a fresh decision', async t => {
+  let f
+  f = await fixture(t, { onClassify: () => f.controller.abort() })
+  await f.pre([user('Public question')])
+  await assert.rejects(f.request(), /abort/i)
+  assert.equal(f.generationRequests().length, 0)
+  const signal = new AbortController().signal
+  await f.pre([user('password=keep-local')], { turn: 2, signal }); await f.request(VIRTUAL, { turn: 2, signal }); await f.stream(VIRTUAL, { signal })
+  assert.equal(f.generationRequests().at(-1).provider, LOCAL.provider)
+})
+
+test('cloud tool calls are refused and errors never silently reroute', async t => {
+  for (const cloudChunks of [[{ type: 'block-start', index: 0, blockType: 'tool-call' }], [{ type: 'finish', reason: { kind: 'error', failure: { code: 'OFFLINE', message: 'offline' } } }]]) await t.test('cloud boundary', async t => {
+    const f = await fixture(t, { cloudChunks })
+    await f.pre([user('Public question')]); await f.request(); const chunks = await f.stream()
+    assert.equal(chunks.some(c => c.blockType === 'tool-call'), false)
+    assert.equal(chunks.at(-1).reason.kind, 'error')
+    assert.equal(f.generationRequests().length, 1)
+    assert.equal(f.generationRequests()[0].provider, CLOUD.provider)
+  })
+})
+
+test('settings validation refuses recursive, untrusted, incomplete, oversized and invalid settings before persistence', async t => {
+  const f = await fixture(t)
+  for (const patch of [{ localProvider: 'cloud-test' }, { localProvider: 'privacy-router' }, { cloudProvider: 'privacy-router' }, { localModel: '' }, { localProvider: '' }, { maxPromptBytes: 0 }, { cloudMaxTokens: 1.5 }, { blockEmails: 'no' }, { trustedProviders: ['cloud-test'] }, { trustedProviderPrefixes: [''] }, { privacyPolicy: 'x'.repeat(16385) }, { sensitiveTerms: [''] }]) {
+    await assert.rejects(f.ctx.settings.update('privacy-router', patch))
   }
+  assert.equal(f.ctx.settings.writes.length, 0)
+  assert.equal(f.ctx.settings.get('privacy-router').localProvider, LOCAL.provider)
+  await f.ctx.settings.update('privacy-router', { blockEmails: false, blockPhones: false, blockLocalPaths: false })
+  const config = f.ctx.settings.get('privacy-router')
+  assert.equal(deterministicBlockReason('test@example.com /home/me/file 13800138000', config), undefined)
+  assert.equal(deterministicBlockReason('password=mandatory-secret', config), 'assigned-secret')
+  await assert.rejects(f.ctx.settings.update('privacy-router', { cloudMaxTokens: 55 }, 0), /conflict|revision/i)
 })
 
-test('recovers a complete classification when max tokens truncates only the reason', async () => {
-  const fixture = context('unknown', {
-    classifierChunks: [
-      {
-        type: 'tool-call-delta',
-        index: 0,
-        id: 'classification',
-        name: 'structured_output',
-        argumentsDelta: '{"classification":"public","reason":"This public request',
-      },
-      { type: 'finish', reason: { kind: 'max-tokens' } },
-    ],
-  })
-  const current = userMessage('Compare HTTP/2 and HTTP/3.', 'truncated-reason')
-  const currentAgent = agent()
-
-  const result = await routeTurn(fixture, currentAgent, [current])
-
-  assert.deepEqual(result.route, { ...CLOUD_ROUTE, maxTokens: 8_192 })
-  assert.equal(currentAgent.events[1].data.classification, 'public')
-  assert.deepEqual(currentAgent.events[1].data.classifier, {
-    finish: 'max-tokens',
-    output: 'tool-call structured_output:\n{"classification":"public","reason":"This public request',
-    reason: 'This public request',
-    reasonTruncated: true,
-  })
+test('catalog advertises virtual choice, proxies local capabilities, and unset local target has setup diagnostic', async t => {
+  const f = await fixture(t)
+  const info = await f.ctx.llm.resolveModelInfo('privacy-router', 'auto')
+  assert.equal(info.name, '智能路由'); assert.equal(info.context.contextWindow, 32768)
+  assert.equal((await f.ctx.llm.listModels('privacy-router'))[0].id, 'auto')
+  const unset = await fixture(t, { unconfigured: true })
+  assert.equal((await unset.ctx.llm.listModels('privacy-router'))[0].name, '智能路由')
+  await assert.rejects(unset.request(), /local|本地|settings/i)
+  assert.equal(resolveConfig().localProvider, '')
 })
 
-test('does not recover a max-token classification from another truncated field', async () => {
-  const fixture = context('unknown', {
-    classifierChunks: [
-      {
-        type: 'tool-call-delta',
-        index: 0,
-        id: 'classification',
-        name: 'structured_output',
-        argumentsDelta: '{"classification":"public","other":"not the required reason',
-      },
-      { type: 'finish', reason: { kind: 'max-tokens' } },
-    ],
-  })
-  const currentAgent = agent()
-
-  const result = await routeTurn(fixture, currentAgent, [userMessage('Ambiguous request')])
-
-  assert.deepEqual(result.route, LOCAL_ROUTE)
-  assert.equal(currentAgent.events[1].data.classification, 'unknown')
-  assert.equal(currentAgent.events[1].data.reason, 'classifier-max-tokens')
+test('host replay-state cleanup cannot erase main-turn admission', async t => {
+  const f = await fixture(t)
+  await f.pre([user('Explain HTTP/3.')]); await f.request()
+  const chunks = await f.stream(VIRTUAL, { messages: [
+    { id: 'prior', role: 'assistant', source: { kind: 'model', ...LOCAL, replayState: { private: 'provider cache' } }, content: [{ type: 'text', text: 'private prior response' }] },
+    user('Explain HTTP/3.'),
+  ] })
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+  assert.equal(f.generationRequests()[0].provider, CLOUD.provider)
+  assert.equal(f.generationRequests()[0].messages.length, 1)
 })
 
-test('provider retry reuses one privacy decision and sanitized cloud candidate', async () => {
-  const fixture = context('public')
-  const current = userMessage('Compare HTTP/2 and HTTP/3 using public information.', 'current')
-  const privateHistory = userMessage('Private path: /Users/example/private-project', 'private-history')
-  const currentAgent = agent()
-
-  await fixture.preStep({
-    agent: currentAgent,
-    messages: [current],
-    turn: 1,
-    step: 1,
-    signal: new AbortController().signal,
-  }, async () => undefined)
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const route = await fixture.request({
-      agent: currentAgent,
-      turn: 1,
-      step: 1,
-      signal: new AbortController().signal,
-    }, async () => LOCAL_ROUTE)
-    assert.deepEqual(route, { ...CLOUD_ROUTE, maxTokens: 8_192 })
-
-    for await (const _chunk of fixture.stream({
-      ...route,
-      messages: [privateHistory, current],
-      system: 'private cwd: /Users/example/private-project',
-      tools: [{ name: 'read_file', description: 'Read local files', parameters: {} }],
-      sessionId: currentAgent.session.id,
-    }, fixture.original)) {}
-  }
-
-  assert.equal(currentAgent.events.length, 4)
-  assert.equal(
-    currentAgent.events.filter(event => event.type === 'privacy-router/cloud-dispatch').length,
-    2,
-  )
-  assert.equal(fixture.requests.length, 3)
-  for (const cloudRequest of fixture.requests.slice(1)) {
-    assert.deepEqual(cloudRequest.messages, [current])
-    assert.deepEqual(cloudRequest.tools, [])
-  }
+test('settings changed while classification is in flight cannot change its turn target', async t => {
+  let release; let began
+  const started = new Promise(resolve => { began = resolve })
+  const pause = new Promise(resolve => { release = resolve })
+  const f = await fixture(t, { onClassify: async () => { began(); await pause } })
+  await f.pre([user('Public question')])
+  const pending = f.request()
+  await started
+  await f.ctx.settings.update('privacy-router', { cloudModel: 'changed-cloud' })
+  release(); await pending; await f.stream()
+  assert.equal(f.generationRequests()[0].model, 'cloud-model')
 })
 
-test('tool continuation reuses the privacy decision for the whole user turn', async () => {
-  const fixture = context('sensitive')
-  const currentAgent = agent()
-
-  await fixture.preStep({
-    agent: currentAgent,
-    messages: [userMessage('Analyze the named local project')],
-    turn: 1,
-    step: 1,
-    signal: new AbortController().signal,
-  }, async () => undefined)
-  await fixture.request({
-    agent: currentAgent,
-    turn: 1,
-    step: 1,
-    signal: new AbortController().signal,
-  }, async () => LOCAL_ROUTE)
-
-  await fixture.preStep({
-    agent: currentAgent,
-    messages: [{
-      id: 'tool-result',
-      role: 'user',
-      content: [{ type: 'tool-result', toolCallId: 'read-1', content: [] }],
-      source: { kind: 'tool', callId: 'read-1' },
-    }],
-    turn: 1,
-    step: 2,
-    signal: new AbortController().signal,
-  }, async () => undefined)
-  const route = await fixture.request({
-    agent: currentAgent,
-    turn: 1,
-    step: 2,
-    signal: new AbortController().signal,
-  }, async () => LOCAL_ROUTE)
-
-  assert.deepEqual(route, LOCAL_ROUTE)
-  assert.equal(currentAgent.events.length, 2)
+test('prompt byte limit counts whitespace that would actually be sent to cloud', async t => {
+  const f = await fixture(t, { config: { maxPromptBytes: 32 } })
+  await f.pre([user(' '.repeat(100) + 'Public question')]); await f.request(); await f.stream()
+  assert.equal(f.classifierRequests().length, 0)
+  assert.equal(f.generationRequests()[0].provider, LOCAL.provider)
 })
 
-test('sensitive input stays on the local route without a cloud request', async () => {
-  const fixture = context('public')
-  const currentAgent = agent()
-  const current = userMessage('Review api_key=not-a-real-secret-value')
-  const result = await routeTurn(
-    fixture,
-    currentAgent,
-    [current],
-  )
 
-  assert.deepEqual(result.route, LOCAL_ROUTE)
-  assert.equal(result.chunks.find(chunk => chunk.type === 'text-delta')?.text, 'local answer')
-  assert.equal(fixture.originalCalls(), 1)
-  assert.equal(fixture.requests.length, 0)
-  assert.deepEqual(currentAgent.events[1].data, {
-    checkId: currentAgent.events[0].data.checkId,
-    turn: 1,
-    step: 1,
-    classification: 'sensitive',
-    method: 'deterministic',
-    decision: 'local',
-    reason: 'assigned-secret',
-    provider: LOCAL_ROUTE.provider,
-    model: LOCAL_ROUTE.model,
-    evaluatedMessageIds: [current.id],
-    durationMs: currentAgent.events[1].data.durationMs,
-  })
+test('overlapping auxiliary calls cannot borrow an admitted main stream on the same signal', async t => {
+  let began; let release
+  const started = new Promise(resolve => { began = resolve })
+  const pause = new Promise(resolve => { release = resolve })
+  const f = await fixture(t, { onGenerate: async request => {
+    if (request.provider === CLOUD.provider) { began(); await pause }
+  } })
+  await f.pre([user('Public question')]); await f.request()
+  const main = f.stream()
+  await started
+  const aux = await collect(f.ctx.llm.stream({ ...VIRTUAL, messages: [user('private auxiliary')],
+    sessionId: f.currentAgent.session.id, signal: f.controller.signal }))
+  assert.equal(aux[0].text, 'local-ai-test answer')
+  release(); await main
+  assert.deepEqual(f.generationRequests().map(request => request.provider), ['cloud-test', 'local-ai-test'])
 })
 
-test('semantic sensitive and unknown classifications stay local', async t => {
-  for (const classification of ['sensitive', 'unknown']) {
-    await t.test(classification, async () => {
-      const fixture = context(classification)
-      const currentAgent = agent()
-      const result = await routeTurn(fixture, currentAgent, [userMessage('Ambiguous standalone request')])
-
-      assert.deepEqual(result.route, LOCAL_ROUTE)
-      assert.equal(result.chunks.find(chunk => chunk.type === 'text-delta')?.text, 'local answer')
-      assert.equal(fixture.requests.length, 1)
-      assert.equal(currentAgent.events[1].data.classification, classification)
-      assert.equal(currentAgent.events[1].data.decision, 'local')
-      assert.equal(currentAgent.events[1].data.provider, LOCAL_ROUTE.provider)
-      assert.equal(currentAgent.events[1].data.model, LOCAL_ROUTE.model)
-    })
-  }
-})
-
-test('cloud tool calls are rejected instead of executing local tools', async () => {
-  const fixture = context('public', {
-    cloudChunks: [
-      { type: 'block-start', index: 0, blockType: 'tool-call' },
-      {
-        type: 'tool-call-delta',
-        index: 0,
-        id: 'unsafe',
-        name: 'read_file',
-        argumentsDelta: '{"path":"secret"}',
-      },
-      { type: 'finish', reason: { kind: 'tool-calls' } },
-    ],
-  })
-
-  const result = await routeTurn(fixture, agent(), [userMessage('Public question')])
-
-  assert.equal(result.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
-  assert.deepEqual(result.chunks.at(-1), {
-    type: 'finish',
-    reason: {
-      kind: 'error',
-      failure: {
-        code: 'PRIVACY_ROUTER_CLOUD_TOOL_CALL',
-        message: 'privacy-router: cloud responses cannot call local tools',
-      },
-    },
-  })
+test('local tool continuations preserve the original target and tools after a settings edit', async t => {
+  const f = await fixture(t)
+  await f.pre([user('password=local-secret')]); await f.request(); await f.stream()
+  await f.ctx.settings.update('privacy-router', { localProvider: 'local-ai-second', localModel: 'second-model' })
+  await f.pre([user('private tool result', { source: { kind: 'tool' } })], { step: 2 })
+  await f.request(VIRTUAL, { step: 2 }); await f.stream()
+  assert.equal(f.generationRequests().at(-1).provider, 'local-ai-test')
+  assert.equal(f.generationRequests().at(-1).tools[0].name, 'read_file')
+  await f.pre([user('password=next-turn-secret')], { turn: 2 }); await f.request(VIRTUAL, { turn: 2 }); await f.stream()
+  assert.equal(f.generationRequests().at(-1).provider, 'local-ai-second')
 })
