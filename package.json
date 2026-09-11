@@ -1,16 +1,19 @@
 {
   "name": "dsh-privacy-router",
-  "version": "0.1.0",
-  "description": "Privacy-gated local/cloud routing for DeepSeek Harness",
+  "version": "0.2.0",
+  "description": "Opt-in privacy-first local/cloud smart router for DeepSeek Harness",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": "./client.js"
   },
   "files": [
     "index.js",
+    "src",
+    "client.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -32,16 +35,29 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/LYiHub/pub-dsh-privacy-router.git"
+    "url": "git+https://github.com/Leon-Geldmann/pub-dsh-privacy-router.git"
   },
-  "homepage": "https://github.com/LYiHub/pub-dsh-privacy-router#readme",
-  "bugs": "https://github.com/LYiHub/pub-dsh-privacy-router/issues",
+  "homepage": "https://github.com/Leon-Geldmann/pub-dsh-privacy-router#readme",
+  "bugs": "https://github.com/Leon-Geldmann/pub-dsh-privacy-router/issues",
   "publishConfig": {
     "access": "public"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
     }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "^0.1.5-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "@deepseek-ai/dsh-settings": "^0.1.5-rc.2"
   }
 }

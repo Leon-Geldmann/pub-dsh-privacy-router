@@ -1,12 +1,10 @@
 - insert:
-    - id: privacy-cloud-router
+    - id: privacy-router
       name: dsh-privacy-router
       config:
+        localProvider: !!js process.env.PRIVACY_ROUTER_LOCAL_PROVIDER || ''
+        localModel: !!js process.env.PRIVACY_ROUTER_LOCAL_MODEL || ''
         cloudProvider: !!js process.env.PRIVACY_ROUTER_CLOUD_PROVIDER || 'deepseek-official'
-        cloudModel: !!js process.env.PRIVACY_ROUTER_CLOUD_MODEL || 'deepseek-v4-flash'
+        cloudModel: !!js process.env.PRIVACY_ROUTER_CLOUD_MODEL || 'deepseek-flash'
         trustedProviderPrefixes:
           - local-ai-
-        privacyPolicy: >-
-          Treat personal data, credentials, local paths, unpublished source code,
-          internal project details, and confidential business information as sensitive.
-        recordSessionEvents: !!js process.env.PRIVACY_ROUTER_SESSION_EVENTS === '1'
