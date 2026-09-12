@@ -283,19 +283,48 @@ const reasoningInfo = (ids, defaultEffort) => ({
   reasoning: { efforts: ids.map(id => ({ id, name: id })), ...(defaultEffort ? { defaultEffort } : {}) },
 })
 
+test('smart router exposes exactly default, off, low, medium and high', async t => {
+  const f = await fixture(t)
+  const info = await f.ctx.llm.resolveModelInfo(VIRTUAL.provider, VIRTUAL.model)
+  assert.deepEqual(info.reasoning.efforts.map(({ id, name }) => [id, name]), [
+    ['auto', '默认'], ['off', '关闭'], ['low', '低'], ['medium', '中'], ['high', '高'],
+  ])
+  assert.equal(info.reasoning.defaultEffort, 'auto')
+  await assert.rejects(f.ctx.llm.prepareCall({ ...VIRTUAL, reasoningEffort: 'max' }), /reasoning effort/i)
+})
+
+test('legacy router max continues as high while direct cloud max stays unchanged', async t => {
+  const f = await fixture(t, { modelInfo: {
+    [LOCAL.provider]: reasoningInfo(['off', 'low', 'medium', 'high']),
+    [CLOUD.provider]: reasoningInfo(['off', 'low', 'high', 'max']),
+  } })
+  for (const [turn, cloud] of [[1, false], [2, true]]) {
+    await f.pre([user(cloud ? 'Explain HTTP/3.' : 'test@example.com')], { turn })
+    const route = await f.request({ ...VIRTUAL, reasoningEffort: 'max' }, { turn })
+    assert.deepEqual(route, { ...VIRTUAL, reasoningEffort: 'high' })
+    const chunks = await f.stream(route)
+    assert.equal(chunks.at(-1).reason.kind, 'stop')
+    assert.equal(f.generationRequests().at(-1).reasoningEffort, cloud ? 'max' : 'high')
+  }
+  const direct = { ...CLOUD, reasoningEffort: 'max' }
+  assert.deepEqual(await f.request(direct, { turn: 3 }), direct)
+  await f.stream(direct)
+  assert.equal(f.generationRequests().at(-1).reasoningEffort, 'max')
+  assert.equal(f.classifierRequests().length, 1)
+})
+
 test('one virtual reasoning selection maps to both actual target capability sets', async t => {
   const choices = [
-    { selected: undefined, local: 'low', cloud: 'high' },
-    { selected: 'auto', local: 'low', cloud: 'high' },
+    { selected: undefined, local: 'medium', cloud: 'high' },
+    { selected: 'auto', local: 'medium', cloud: 'high' },
     { selected: 'off', local: 'off', cloud: 'off' },
     { selected: 'low', local: 'low', cloud: 'low' },
-    { selected: 'medium', local: 'medium', cloud: 'low' },
-    { selected: 'high', local: 'high', cloud: 'high' },
-    { selected: 'max', local: 'high', cloud: 'max' },
+    { selected: 'medium', local: 'medium', cloud: 'high' },
+    { selected: 'high', local: 'high', cloud: 'max' },
   ]
   for (const choice of choices) for (const cloud of [false, true]) await t.test(`${choice.selected ?? 'unset'} -> ${cloud ? 'cloud' : 'local'}`, async t => {
     const f = await fixture(t, { modelInfo: {
-      [LOCAL.provider]: reasoningInfo(['off', 'low', 'medium', 'high'], 'low'),
+      [LOCAL.provider]: reasoningInfo(['off', 'low', 'medium', 'high']),
       [CLOUD.provider]: reasoningInfo(['off', 'low', 'high', 'max'], 'high'),
     } })
     const selected = { ...VIRTUAL, ...(choice.selected ? { reasoningEffort: choice.selected } : {}) }
@@ -313,6 +342,22 @@ test('one virtual reasoning selection maps to both actual target capability sets
       assert.doesNotMatch(JSON.stringify(sent), /private runtime|private full/)
     }
   })
+})
+
+test('default follows the local model default and maps that tier to cloud', async t => {
+  for (const [localDefault, cloudEffort] of [['off', 'off'], ['low', 'low'], ['medium', 'high'], ['high', 'max']]) {
+    for (const cloud of [false, true]) await t.test(`${localDefault} default -> ${cloud ? 'cloud' : 'local'}`, async t => {
+      const f = await fixture(t, { modelInfo: {
+        [LOCAL.provider]: reasoningInfo(['off', 'low', 'medium', 'high'], localDefault),
+        [CLOUD.provider]: reasoningInfo(['off', 'low', 'high', 'max'], 'high'),
+      } })
+      await f.pre([user(cloud ? 'Explain HTTP/3.' : 'test@example.com')])
+      const route = await f.request({ ...VIRTUAL, reasoningEffort: 'auto' })
+      const chunks = await f.stream(route)
+      assert.equal(chunks.at(-1).reason.kind, 'stop')
+      assert.equal(f.generationRequests()[0].reasoningEffort, cloud ? cloudEffort : localDefault)
+    })
+  }
 })
 
 test('models without reasoning controls receive no reasoning parameter on either route', async t => {
@@ -343,11 +388,10 @@ test('turning reasoning off never silently enables it on a reasoning-only target
 test('ranked and binary targets map supported intensities without inventing provider values', async t => {
   const cases = [
     { ids: ['off', 'minimal', 'xhigh'], selected: 'low', want: 'minimal' },
-    { ids: ['off', 'minimal', 'xhigh'], selected: 'max', want: 'xhigh' },
+    { ids: ['off', 'minimal', 'xhigh'], selected: 'high', want: 'xhigh' },
     { ids: ['off', 'high'], selected: 'low', want: 'high' },
     { ids: ['off', 'on'], selected: 'medium', want: 'on' },
     { ids: ['off'], selected: 'high', want: 'off' },
-    { ids: ['adaptive'], selected: 'auto', want: 'adaptive' },
   ]
   for (const row of cases) await t.test(`${row.ids.join('/')} ${row.selected}`, async t => {
     const f = await fixture(t, { modelInfo: { [CLOUD.provider]: reasoningInfo(row.ids, row.ids.at(-1)) } })
@@ -359,7 +403,7 @@ test('ranked and binary targets map supported intensities without inventing prov
   })
 })
 
-test('unknown target intensity semantics reject explicit levels but preserve model defaults', async t => {
+test('unknown target intensity semantics reject unmappable levels', async t => {
   const f = await fixture(t, { modelInfo: { [CLOUD.provider]: reasoningInfo(['adaptive'], 'adaptive') } })
   await f.pre([user('Explain HTTP/3.')])
   const route = await f.request({ ...VIRTUAL, reasoningEffort: 'high' })
