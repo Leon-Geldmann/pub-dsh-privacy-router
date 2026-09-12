@@ -76,6 +76,8 @@ export function apply(ctx, inputConfig) {
       decisions.set(payload.agent, decision)
     }
     if (payload.signal) admissions.set(payload.signal, decision)
-    return proposal
+    // Older router sessions saved a sixth "max" choice. Keep them usable with
+    // the five-choice menu; direct providers returned above retain their enums.
+    return proposal.reasoningEffort === 'max' ? { ...proposal, reasoningEffort: 'high' } : proposal
   })
 }

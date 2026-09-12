@@ -1,6 +1,6 @@
 {
   "name": "dsh-privacy-router",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Opt-in privacy-first local/cloud smart router for DeepSeek Harness",
   "type": "module",
   "main": "index.js",
