@@ -54,6 +54,13 @@ export function apply(ctx, inputConfig) {
       if (!config.localProvider) throw new Error('privacy-router: configure a trusted local model in 智能路由 settings first')
       const captured = candidates.get(payload.agent)
       candidates.delete(payload.agent)
+      if (config.mode === 'collaboration') {
+        if (!captured?.candidate) throw new Error('协作开发目前接受直接输入的文本需求；文件请放入已配置的项目目录。')
+        decision = deepFreeze({ turn: payload.turn, sessionId: String(payload.agent.session.id), config, candidate: captured.candidate })
+        decisions.set(payload.agent, decision)
+        if (payload.signal) admissions.set(payload.signal, decision)
+        return proposal.reasoningEffort === 'max' ? { ...proposal, reasoningEffort: 'high' } : proposal
+      }
       const candidate = captured?.turn === payload.turn && captured.candidate !== undefined
         ? contextualizeCandidate({ deriveMessages: () => captured.history }, captured.candidate, config)
         : undefined

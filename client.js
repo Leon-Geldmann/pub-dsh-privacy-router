@@ -20,11 +20,21 @@ window.__ModuleLoader__.load({
       'maxPromptBytes',
       'classifierMaxTokens',
       'cloudMaxTokens',
+      'mode',
+      'projectRoot',
+      'publicPaths',
+      'privatePaths',
+      'publicBrief',
+      'maxAgentSteps',
+      'commandTimeoutSeconds',
+      'integrationCommand',
     ]
     const LIMITS = {
       maxPromptBytes: { label: '最大提示词字节数', maximum: 1048576 },
       classifierMaxTokens: { label: '分类器最大输出 token', maximum: 1024 },
       cloudMaxTokens: { label: '云端最大输出 token', maximum: 65536 },
+      maxAgentSteps: { label: '代理最大步骤数', maximum: 64 },
+      commandTimeoutSeconds: { label: '命令超时（秒）', maximum: 300 },
     }
     const styles = `
       .dpr-section{box-sizing:border-box;max-width:720px;color:var(--dsw-alias-label-primary);display:flex;flex-direction:column;gap:16px;padding:0 0 24px}
@@ -96,6 +106,14 @@ window.__ModuleLoader__.load({
         maxPromptBytes: String(value.maxPromptBytes ?? ''),
         classifierMaxTokens: String(value.classifierMaxTokens ?? ''),
         cloudMaxTokens: String(value.cloudMaxTokens ?? ''),
+        mode: value.mode === 'collaboration' ? 'collaboration' : 'routing',
+        projectRoot: typeof value.projectRoot === 'string' ? value.projectRoot : '',
+        publicPaths: Array.isArray(value.publicPaths) ? value.publicPaths.join('\n') : '',
+        privatePaths: Array.isArray(value.privatePaths) ? value.privatePaths.join('\n') : '',
+        publicBrief: typeof value.publicBrief === 'string' ? value.publicBrief : '',
+        maxAgentSteps: String(value.maxAgentSteps ?? 16),
+        commandTimeoutSeconds: String(value.commandTimeoutSeconds ?? 60),
+        integrationCommand: typeof value.integrationCommand === 'string' ? value.integrationCommand : 'node --test',
       }
     }
 
@@ -141,6 +159,20 @@ window.__ModuleLoader__.load({
       return terms
     }
 
+    function validPathRule(path) {
+      if (path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) return false
+      if (path.includes('\\') || /[*?\[\]{}]/.test(path)) return false
+      const parts = path.endsWith('/') ? path.slice(0, -1).split('/') : path.split('/')
+      return parts.length > 0 && parts.every(part => part.length > 0 && part !== '.' && part !== '..')
+    }
+
+    function validatePathRules(label, value) {
+      for (const path of parseTerms(value)) {
+        if (!validPathRule(path)) return `${label}只能填写相对文件路径或以 / 结尾的目录，不能使用绝对路径、路径穿越或通配符。`
+      }
+      return undefined
+    }
+
     function validateDraft(draft, localChoices, cloudChoices) {
       if (!localChoices.some(choice => choice.value === draft.localRoute)) return '请选择受信任且当前可用的本地模型。'
       if (!cloudChoices.some(choice => choice.value === draft.cloudRoute)) return '请选择当前可用的云端模型。'
@@ -151,6 +183,14 @@ window.__ModuleLoader__.load({
         if (!Number.isInteger(value) || value < 1 || value > constraint.maximum) {
           return `${constraint.label} 必须是 1 到 ${constraint.maximum} 之间的整数。`
         }
+      }
+      if (draft.mode !== 'routing' && draft.mode !== 'collaboration') return '请选择有效的工作模式。'
+      if (draft.mode === 'collaboration') {
+        if (draft.projectRoot.length > 0 && !draft.projectRoot.startsWith('/')) return '项目根目录必须是绝对路径，也可以留空稍后设置。'
+        const publicPathError = validatePathRules('公开路径', draft.publicPaths)
+        if (publicPathError) return publicPathError
+        const privatePathError = validatePathRules('私密路径', draft.privatePaths)
+        if (privatePathError) return privatePathError
       }
       return undefined
     }
@@ -171,6 +211,14 @@ window.__ModuleLoader__.load({
         maxPromptBytes: Number(draft.maxPromptBytes),
         classifierMaxTokens: Number(draft.classifierMaxTokens),
         cloudMaxTokens: Number(draft.cloudMaxTokens),
+        mode: draft.mode,
+        projectRoot: draft.projectRoot,
+        publicPaths: parseTerms(draft.publicPaths),
+        privatePaths: parseTerms(draft.privatePaths),
+        publicBrief: draft.publicBrief,
+        maxAgentSteps: Number(draft.maxAgentSteps),
+        commandTimeoutSeconds: Number(draft.commandTimeoutSeconds),
+        integrationCommand: draft.integrationCommand,
       }
     }
 
@@ -224,6 +272,33 @@ window.__ModuleLoader__.load({
           disabled: disabled || choices.length === 0,
           onChange,
         }, options),
+      )
+    }
+
+    function SelectField({ label, value, choices, disabled, onChange }) {
+      return h('label', { className: 'dpr-field' },
+        label,
+        h('select', {
+          className: 'dpr-input',
+          'aria-label': label,
+          value,
+          disabled,
+          onChange,
+        }, choices.map(option)),
+      )
+    }
+
+    function InputField({ label, value, disabled, onChange }) {
+      return h('label', { className: 'dpr-field' },
+        label,
+        h('input', {
+          className: 'dpr-input',
+          type: 'text',
+          'aria-label': label,
+          value,
+          disabled,
+          onChange,
+        }),
       )
     }
 
@@ -380,8 +455,26 @@ window.__ModuleLoader__.load({
         state.error && h('p', { className: 'dpr-message dpr-error', role: 'alert' }, state.error),
         state.notice && h('p', { className: 'dpr-message dpr-success', role: 'status' }, state.notice),
         h('div', { className: 'dpr-card' },
+          h('h3', { className: 'dpr-card-title' }, '工作模式'),
+          h(SelectField, {
+            label: '工作模式',
+            value: draft.mode,
+            choices: [
+              { value: 'routing', label: '智能路由' },
+              { value: 'collaboration', label: '私密开发协作' },
+            ],
+            disabled,
+            onChange: event => update('mode', event.target.value),
+          }),
+          h('p', { className: 'dpr-hint' }, draft.mode === 'collaboration'
+            ? '云端开发负责人处理明确公开的资料，本地工作者处理私密代码和未公开指令。'
+            : '根据当前消息的隐私判断，在本地模型和云端模型之间选择。'),
+        ),
+        h('div', { className: 'dpr-card' },
           h('h3', { className: 'dpr-card-title' }, '路由目标'),
-          h('p', { className: 'dpr-hint' }, '敏感、无法判断或依赖本地上下文的内容使用本地模型；仅将判定为公开的当前文本发送给云端模型。'),
+          h('p', { className: 'dpr-hint' }, draft.mode === 'collaboration'
+            ? '云端模型负责已授权的公开任务，本地模型处理私密实现与未公开指令。'
+            : '敏感、无法判断或依赖本地上下文的内容使用本地模型；仅将判定为公开的当前文本发送给云端模型。'),
           h('div', { className: 'dpr-grid' },
             h(ModelSelect, {
               label: '本地模型',
@@ -407,8 +500,56 @@ window.__ModuleLoader__.load({
             h('p', { className: 'dpr-hint' }, '不支持推理控制的模型照常回答。只能开启推理的模型无法使用“关闭”，会明确提示；无法匹配档位时可直接选择该模型。'),
           ),
         ),
+        draft.mode === 'collaboration' && h('div', { className: 'dpr-card' },
+          h('h3', { className: 'dpr-card-title' }, '私密开发协作'),
+          h('p', { className: 'dpr-hint' }, '公开路径前缀是明确的共享授权；私密路径前缀优先。未匹配或未知内容保留在本地。'),
+          h('p', { className: 'dpr-hint' }, '只有直接发送且以 /公开 开头的当前这一条消息可供外部使用，不会共享此前的聊天记录。公开项目简介会发送给云端。'),
+          h(InputField, {
+            label: '项目根目录',
+            value: draft.projectRoot,
+            disabled,
+            onChange: event => update('projectRoot', event.target.value),
+          }),
+          h('div', { className: 'dpr-grid' },
+            h(TextField, {
+              label: '公开路径（每行一个）',
+              value: draft.publicPaths,
+              rows: 4,
+              className: 'dpr-terms',
+              disabled,
+              onChange: event => update('publicPaths', event.target.value),
+            }),
+            h(TextField, {
+              label: '私密路径（每行一个）',
+              value: draft.privatePaths,
+              rows: 4,
+              className: 'dpr-terms',
+              disabled,
+              onChange: event => update('privatePaths', event.target.value),
+            }),
+          ),
+          h(TextField, {
+            label: '公开项目简介',
+            value: draft.publicBrief,
+            rows: 4,
+            disabled,
+            onChange: event => update('publicBrief', event.target.value),
+          }),
+          h('div', { className: 'dpr-grid' },
+            h(LimitField, { name: 'maxAgentSteps', draft, disabled, update }),
+            h(LimitField, { name: 'commandTimeoutSeconds', draft, disabled, update }),
+          ),
+          h(InputField, {
+            label: '集成测试命令',
+            value: draft.integrationCommand,
+            disabled,
+            onChange: event => update('integrationCommand', event.target.value),
+          }),
+          h('p', { className: 'dpr-hint' }, '该命令只由你在设置中指定，在线模型不能自行指定或更改在私有项目中执行的命令。仅在本地隔离环境执行，原始输出留在本地。云端仅收到固定执行回执，完整结果只在本地显示。'),
+        ),
         h('div', { className: 'dpr-card' },
           h('h3', { className: 'dpr-card-title' }, '隐私判断'),
+          draft.mode === 'collaboration' && h('p', { className: 'dpr-hint' }, '协作模式以公开路径、项目简介和 /公开 消息为共享授权，并检查凭证和敏感词。下面的自然语言规则及邮箱、电话、路径开关仅用于智能路由模式。'),
           h(TextField, {
             label: '隐私规则',
             value: draft.privacyPolicy,

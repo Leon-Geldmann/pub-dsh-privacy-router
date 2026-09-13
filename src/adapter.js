@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { isAgentLoopRequest, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { CLOUD_SYSTEM_PROMPT, cloudStream, errorStream } from './privacy.js'
+import { runCollaboration } from './collaboration.js'
 
 const identity = { provider: 'privacy-router', id: 'auto', name: '智能路由' }
 const routerReasoning = {
@@ -127,6 +128,11 @@ export class PrivacyRouterAdapter extends LlmAdapter {
     const scope = this.streamAdmission.getStore()
     const admitted = scope?.main && scope.signal === options.signal && options.purpose === undefined
       && scope.sessionId === String(options.sessionId) && decision?.sessionId === scope.sessionId
+    if (admitted && config.mode === 'collaboration') {
+      yield* runCollaboration({ ctx: this.ctx, options, decision, config,
+        reasoningFor: this.targetReasoning.bind(this), readSettings: this.readSettings })
+      return
+    }
     if (admitted && decision.useCloud) {
       const reasoning = await this.targetReasoning(config.cloudProvider, config.cloudModel, options.reasoningEffort, options.signal, config)
       // Explicit allowlist: no runtime system context, history, tool schemas, replay

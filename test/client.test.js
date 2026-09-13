@@ -122,6 +122,14 @@ function namespaceView(overrides = {}) {
       maxPromptBytes: 32768,
       classifierMaxTokens: 128,
       cloudMaxTokens: 8192,
+      mode: 'routing',
+      projectRoot: '',
+      publicPaths: [],
+      privatePaths: [],
+      publicBrief: '',
+      maxAgentSteps: 16,
+      commandTimeoutSeconds: 60,
+      integrationCommand: 'node --test',
       trustedProviders: ['ollama'],
       trustedProviderPrefixes: ['local-'],
       ...overrides,
@@ -244,6 +252,134 @@ test('registers the 智能路由 settings section and constrains local choices t
   assert.deepEqual(optionValues(findByLabel(fixture.harness.tree(), '云端模型')), [
     'deepseek-official/deepseek-chat',
   ])
+})
+
+test('shows collaboration controls only in collaboration mode and explains each sharing boundary', async () => {
+  const fixture = await loadFixture()
+
+  const mode = findByLabel(fixture.harness.tree(), '工作模式')
+  assert.deepEqual(optionValues(mode), ['routing', 'collaboration'])
+  assert.equal(mode.props.value, 'routing')
+  assert.equal(allNodes(fixture.harness.tree()).some(node => node.props?.['aria-label'] === '项目根目录'), false)
+
+  mode.props.onChange({ target: { value: 'collaboration' } })
+
+  assert.equal(findByLabel(fixture.harness.tree(), '项目根目录').props.value, '')
+  const explanation = textOf(fixture.harness.tree())
+  assert.match(explanation, /公开路径前缀是明确的共享授权/)
+  assert.match(explanation, /私密路径前缀优先/)
+  assert.match(explanation, /未知内容保留在本地/)
+  assert.match(explanation, /\/公开.*当前这一条消息/)
+  assert.match(explanation, /公开项目简介.*发送给云端/)
+})
+
+test('round-trips collaboration settings and converts path lines to arrays', async () => {
+  const fixture = await loadFixture({
+    view: namespaceView({
+      mode: 'collaboration',
+      projectRoot: '/home/test/Projects/example',
+      publicPaths: ['public/'],
+      privatePaths: ['private/', 'secrets.txt'],
+      publicBrief: '只包含可公开的接口说明。',
+      maxAgentSteps: 24,
+      commandTimeoutSeconds: 90,
+    }),
+  })
+
+  assert.equal(findByLabel(fixture.harness.tree(), '公开路径（每行一个）').props.value, 'public/')
+  assert.equal(findByLabel(fixture.harness.tree(), '私密路径（每行一个）').props.value, 'private/\nsecrets.txt')
+  findByLabel(fixture.harness.tree(), '公开路径（每行一个）').props.onChange({
+    target: { value: 'public/\n\n  contracts/api.json  \npublic/' },
+  })
+
+  await findButton(fixture.harness.tree(), '保存').props.onClick()
+  await flush()
+
+  assert.equal(fixture.updates.length, 1)
+  const patch = fixture.updates[0][1]
+  assert.deepEqual(Array.from(patch.publicPaths), ['public/', 'contracts/api.json'])
+  assert.deepEqual(Array.from(patch.privatePaths), ['private/', 'secrets.txt'])
+  assert.equal(patch.mode, 'collaboration')
+  assert.equal(patch.projectRoot, '/home/test/Projects/example')
+  assert.equal(patch.publicBrief, '只包含可公开的接口说明。')
+  assert.equal(patch.maxAgentSteps, 24)
+  assert.equal(patch.commandTimeoutSeconds, 90)
+})
+
+test('round-trips the locally configured integration command and explains its fixed cloud receipt', async () => {
+  const fixture = await loadFixture({
+    view: namespaceView({
+      mode: 'collaboration',
+      integrationCommand: 'npm run integration',
+    }),
+  })
+
+  const command = findByLabel(fixture.harness.tree(), '集成测试命令')
+  assert.equal(command.props.value, 'npm run integration')
+  const explanation = textOf(fixture.harness.tree())
+  assert.match(explanation, /仅在本地隔离环境执行，原始输出留在本地/)
+  assert.match(explanation, /在线模型不能.*指定.*命令/)
+  assert.match(explanation, /云端.*固定执行回执，完整结果只在本地显示/)
+
+  command.props.onChange({ target: { value: 'node --test test/integration.test.js' } })
+  await findButton(fixture.harness.tree(), '保存').props.onClick()
+  await flush()
+
+  assert.equal(fixture.updates.length, 1)
+  assert.equal(fixture.updates[0][1].integrationCommand, 'node --test test/integration.test.js')
+})
+
+test('saving a routing field preserves loaded collaboration settings', async () => {
+  const collaboration = {
+    mode: 'routing',
+    projectRoot: '/home/test/Projects/example',
+    publicPaths: ['public/'],
+    privatePaths: ['private/'],
+    publicBrief: '公开说明',
+    maxAgentSteps: 32,
+    commandTimeoutSeconds: 120,
+  }
+  const fixture = await loadFixture({ view: namespaceView(collaboration) })
+  findByLabel(fixture.harness.tree(), '隐私规则').props.onChange({ target: { value: '更新后的规则' } })
+
+  await findButton(fixture.harness.tree(), '保存').props.onClick()
+  await flush()
+
+  const patch = fixture.updates[0][1]
+  for (const [key, value] of Object.entries(collaboration)) {
+    if (Array.isArray(value)) assert.deepEqual(Array.from(patch[key]), value)
+    else assert.equal(patch[key], value)
+  }
+})
+
+test('rejects unsafe collaboration path rules before persistence', async () => {
+  const invalidPaths = ['/absolute/public', '../private', 'public/*', 'safe/../../private']
+  for (const invalidPath of invalidPaths) {
+    const fixture = await loadFixture({ view: namespaceView({ mode: 'collaboration' }) })
+    findByLabel(fixture.harness.tree(), '公开路径（每行一个）').props.onChange({ target: { value: invalidPath } })
+
+    await findButton(fixture.harness.tree(), '保存').props.onClick()
+
+    assert.equal(fixture.updates.length, 0, invalidPath)
+    assert.match(textOf(fixture.harness.tree()), /公开路径.*相对文件路径或以 \/ 结尾的目录/)
+  }
+})
+
+test('rejects collaboration limits outside their supported ranges before persistence', async () => {
+  const fixture = await loadFixture({ view: namespaceView({ mode: 'collaboration' }) })
+  findByLabel(fixture.harness.tree(), '代理最大步骤数').props.onChange({ target: { value: '65' } })
+
+  await findButton(fixture.harness.tree(), '保存').props.onClick()
+
+  assert.equal(fixture.updates.length, 0)
+  assert.match(textOf(fixture.harness.tree()), /代理最大步骤数 必须是 1 到 64 之间的整数/)
+
+  findByLabel(fixture.harness.tree(), '代理最大步骤数').props.onChange({ target: { value: '16' } })
+  findByLabel(fixture.harness.tree(), '命令超时（秒）').props.onChange({ target: { value: '0' } })
+  await findButton(fixture.harness.tree(), '保存').props.onClick()
+
+  assert.equal(fixture.updates.length, 0)
+  assert.match(textOf(fixture.harness.tree()), /命令超时（秒） 必须是 1 到 300 之间的整数/)
 })
 
 test('rejects classifier output above the backend limit before it reaches settings.update', async () => {
